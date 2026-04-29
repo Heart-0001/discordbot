@@ -160,8 +160,23 @@ class MusicCog(commands.Cog):
             source = make_source(next_song['url'], state.volume)
             voice_client.play(source, after=lambda e: self._after_play(e, guild_id, voice_client))
             log.info(f'開始播放: {next_song["title"]}')
+            # 預先在背景抓好下一首的串流 URL，減少換歌延遲
+            if state.queue and not state.queue[0].get('url'):
+                asyncio.ensure_future(self._prefetch_next(state))
         except Exception as e:
             log.error(f'播放失敗: {e}')
+
+    async def _prefetch_next(self, state: 'GuildMusicState'):
+        if not state.queue:
+            return
+        next_song = state.queue[0]
+        if next_song.get('url'):
+            return
+        try:
+            next_song['url'] = await self.fetch_stream_url(next_song['webpage_url'])
+            log.info(f'預載完成: {next_song["title"]}')
+        except Exception as e:
+            log.error(f'預載失敗: {e}')
 
     def fmt_duration(self, seconds) -> str:
         if not seconds:
@@ -300,24 +315,26 @@ class MusicCog(commands.Cog):
         embed = discord.Embed(title='🎵 播放隊列', color=discord.Color.purple())
 
         if state.current:
-            embed.add_field(
-                name='🎶 正在播放',
-                value=f'[{state.current["title"]}]({state.current["webpage_url"]}) `{self.fmt_duration(state.current["duration"])}`',
-                inline=False,
-            )
+            t = state.current['title']
+            t = t[:60] + '…' if len(t) > 60 else t
+            embed.description = f'**🎶 正在播放**\n[{t}]({state.current["webpage_url"]}) `{self.fmt_duration(state.current["duration"])}`'
 
         if state.queue:
-            lines = [
-                f'`{i}.` [{s["title"]}]({s["webpage_url"]}) `{self.fmt_duration(s["duration"])}`'
-                for i, s in enumerate(state.queue[:10], 1)
-            ]
-            if len(state.queue) > 10:
-                lines.append(f'*... 還有 {len(state.queue) - 10} 首*')
-            embed.add_field(name='📋 待播清單', value='\n'.join(lines), inline=False)
+            lines = []
+            total = 0
+            for i, s in enumerate(state.queue[:20], 1):
+                title = s['title'][:45] + '…' if len(s['title']) > 45 else s['title']
+                line = f'`{i}.` {title} `{self.fmt_duration(s["duration"])}`'
+                total += len(line) + 1
+                if total > 3800:
+                    lines.append(f'*... 還有更多首*')
+                    break
+                lines.append(line)
+            if len(state.queue) > 20:
+                lines.append(f'*... 還有 {len(state.queue) - 20} 首*')
+            embed.description = (embed.description or '') + '\n\n**📋 待播清單**\n' + '\n'.join(lines)
         elif not state.current:
             embed.description = '隊列是空的，用 `/play` 來新增音樂！'
-        else:
-            embed.add_field(name='📋 待播清單', value='空的', inline=False)
 
         await interaction.response.send_message(embed=embed)
 
