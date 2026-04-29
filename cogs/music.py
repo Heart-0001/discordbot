@@ -13,7 +13,7 @@ log = logging.getLogger(__name__)
 FFMPEG_PATH = r'C:\Users\Heart\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin\ffmpeg.exe'
 
 FFMPEG_BEFORE_OPTS = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
-FFMPEG_OPTS = '-vn'
+FFMPEG_OPTS = '-vn -b:a 96k'  # 限制輸出 96kbps，符合 Discord 上限
 
 
 def make_source(url: str, volume: float) -> discord.PCMVolumeTransformer:
@@ -106,7 +106,7 @@ class MusicCog(commands.Cog):
                 sys.executable, '-m', 'yt_dlp',
                 '--dump-json', '--quiet', '--no-warnings',
                 '--no-playlist',
-                '--format', 'bestaudio/best',
+                '--format', 'bestaudio[abr<=96]/bestaudio/best',
                 '--ffmpeg-location', FFMPEG_PATH,
                 search_query,
             ], timeout=30)
@@ -121,7 +121,7 @@ class MusicCog(commands.Cog):
             sys.executable, '-m', 'yt_dlp',
             '--dump-json', '--quiet', '--no-warnings',
             '--no-playlist',
-            '--format', 'bestaudio/best',
+            '--format', 'bestaudio[abr<=96]/bestaudio/best',
             '--ffmpeg-location', FFMPEG_PATH,
             webpage_url,
         ], timeout=30)
