@@ -1,0 +1,41 @@
+import asyncio
+import logging
+import os
+import sys
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+log = logging.getLogger(__name__)
+
+load_dotenv()
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.voice_states = True
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    log.info(f'✅ {bot.user} 已上線！連接到 {len(bot.guilds)} 個伺服器')
+
+
+async def main():
+    async with bot:
+        await bot.load_extension('cogs.music')
+        await bot.start(os.getenv('DISCORD_TOKEN'))
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

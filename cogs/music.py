@@ -1,0 +1,376 @@
+import asyncio
+import json
+import logging
+import sys
+from typing import Optional
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+log = logging.getLogger(__name__)
+
+FFMPEG_PATH = r'C:\Users\Heart\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin\ffmpeg.exe'
+
+FFMPEG_BEFORE_OPTS = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+FFMPEG_OPTS = '-vn'
+
+
+def make_source(url: str, volume: float) -> discord.PCMVolumeTransformer:
+    return discord.PCMVolumeTransformer(
+        discord.FFmpegPCMAudio(
+            url,
+            executable=FFMPEG_PATH,
+            before_options=FFMPEG_BEFORE_OPTS,
+            options=FFMPEG_OPTS,
+        ),
+        volume=volume,
+    )
+
+
+class GuildMusicState:
+    def __init__(self):
+        self.queue: list[dict] = []
+        self.current: Optional[dict] = None
+        self.volume: float = 0.5
+
+
+class MusicCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self._states: dict[int, GuildMusicState] = {}
+
+    def get_state(self, guild_id: int) -> GuildMusicState:
+        if guild_id not in self._states:
+            self._states[guild_id] = GuildMusicState()
+        return self._states[guild_id]
+
+    async def _run_ytdlp(self, args: list, timeout: int = 30) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise Exception('取得音樂超時')
+        if not stdout:
+            err = stderr.decode('utf-8', errors='replace')
+            raise Exception(err[:300] or '無法取得音樂')
+        return stdout.decode('utf-8', errors='replace')
+
+    def _parse_ytdlp_lines(self, text: str, stream_url: bool = True) -> list[dict]:
+        results = []
+        for line in text.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+                # flat-playlist entries have 'id', full entries have 'url'
+                webpage = d.get('webpage_url') or (
+                    f"https://www.youtube.com/watch?v={d['id']}" if d.get('id') else ''
+                )
+                results.append({
+                    'url': d.get('url', '') if stream_url else '',
+                    'webpage_url': webpage,
+                    'title': d.get('title', 'Unknown'),
+                    'duration': d.get('duration', 0),
+                    'thumbnail': d.get('thumbnail', ''),
+                    'uploader': d.get('uploader', ''),
+                })
+            except (json.JSONDecodeError, KeyError):
+                continue
+        return results
+
+    async def fetch_info(self, query: str) -> list[dict]:
+        is_url = query.startswith('http')
+        is_playlist = is_url and 'list=' in query
+
+        log.info(f'fetch_info 開始: {query[:80]}')
+
+        if is_playlist:
+            # Fast path: flat-playlist (just metadata, no stream URLs)
+            out = await self._run_ytdlp([
+                sys.executable, '-m', 'yt_dlp',
+                '--flat-playlist', '--dump-json', '--quiet', '--no-warnings',
+                '--playlist-items', '1:50',
+                query,
+            ], timeout=30)
+            results = self._parse_ytdlp_lines(out, stream_url=False)
+        else:
+            search_query = query if is_url else f'ytsearch1:{query}'
+            out = await self._run_ytdlp([
+                sys.executable, '-m', 'yt_dlp',
+                '--dump-json', '--quiet', '--no-warnings',
+                '--no-playlist',
+                '--format', 'bestaudio/best',
+                '--ffmpeg-location', FFMPEG_PATH,
+                search_query,
+            ], timeout=30)
+            results = self._parse_ytdlp_lines(out, stream_url=True)
+
+        log.info(f'fetch_info 完成: {len(results)} 首')
+        return results
+
+    async def fetch_stream_url(self, webpage_url: str) -> str:
+        """播放前取得實際串流 URL。"""
+        out = await self._run_ytdlp([
+            sys.executable, '-m', 'yt_dlp',
+            '--dump-json', '--quiet', '--no-warnings',
+            '--no-playlist',
+            '--format', 'bestaudio/best',
+            '--ffmpeg-location', FFMPEG_PATH,
+            webpage_url,
+        ], timeout=30)
+        data = json.loads(out.strip().split('\n')[0])
+        return data['url']
+
+    def _after_play(self, error, guild_id: int, voice_client: discord.VoiceClient):
+        if error:
+            log.error(f'播放回呼錯誤: {error}')
+        asyncio.run_coroutine_threadsafe(
+            self._play_next(guild_id, voice_client), self.bot.loop
+        )
+
+    async def _play_next(self, guild_id: int, voice_client: discord.VoiceClient):
+        if not voice_client.is_connected():
+            return
+
+        state = self.get_state(guild_id)
+        if not state.queue:
+            state.current = None
+            return
+
+        next_song = state.queue.pop(0)
+
+        # Always fetch fresh stream URL (flat-playlist items have empty url)
+        try:
+            next_song['url'] = await self.fetch_stream_url(next_song['webpage_url'])
+        except Exception as e:
+            log.error(f'重新取得 URL 失敗，跳過: {e}')
+            await self._play_next(guild_id, voice_client)
+            return
+
+        state.current = next_song
+
+        try:
+            source = make_source(next_song['url'], state.volume)
+            voice_client.play(source, after=lambda e: self._after_play(e, guild_id, voice_client))
+            log.info(f'開始播放: {next_song["title"]}')
+        except Exception as e:
+            log.error(f'播放失敗: {e}')
+
+    def fmt_duration(self, seconds) -> str:
+        if not seconds:
+            return '未知'
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        return f'{h}:{m:02d}:{s:02d}' if h else f'{m}:{s:02d}'
+
+    def song_embed(self, title: str, song: dict, color: discord.Color) -> discord.Embed:
+        embed = discord.Embed(
+            title=title,
+            description=f'[{song["title"]}]({song["webpage_url"]})',
+            color=color,
+        )
+        embed.add_field(name='長度', value=self.fmt_duration(song['duration']))
+        if song['uploader']:
+            embed.add_field(name='頻道', value=song['uploader'])
+        if song['thumbnail']:
+            embed.set_thumbnail(url=song['thumbnail'])
+        return embed
+
+    @app_commands.command(name='play', description='播放 YouTube / YouTube Music 音樂（網址或搜尋）')
+    @app_commands.describe(query='YouTube 連結或歌曲名稱關鍵字')
+    async def play(self, interaction: discord.Interaction, query: str):
+        if not interaction.user.voice:
+            await interaction.response.send_message('❌ 請先加入一個語音頻道！', ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        vc = interaction.guild.voice_client
+        if vc is None:
+            vc = await interaction.user.voice.channel.connect()
+        elif vc.channel != interaction.user.voice.channel:
+            await vc.move_to(interaction.user.voice.channel)
+
+        state = self.get_state(interaction.guild_id)
+
+        try:
+            songs = await self.fetch_info(query)
+        except Exception as e:
+            log.error(f'fetch_info 失敗: {e}')
+            await interaction.followup.send(f'❌ 無法取得音樂：{e}')
+            return
+
+        if not songs:
+            await interaction.followup.send('❌ 找不到音樂')
+            return
+
+        log.info(f'取得音樂: {songs[0]["title"]} (共 {len(songs)} 首)')
+
+        if vc.is_playing() or vc.is_paused():
+            state.queue.extend(songs)
+            if len(songs) > 1:
+                embed = discord.Embed(
+                    title='✅ 播放清單已加入隊列',
+                    description=f'加入了 **{len(songs)}** 首歌曲',
+                    color=discord.Color.green(),
+                )
+            else:
+                embed = self.song_embed('✅ 已加入隊列', songs[0], discord.Color.green())
+                embed.add_field(name='隊列位置', value=str(len(state.queue)))
+            await interaction.followup.send(embed=embed)
+        else:
+            first, rest = songs[0], songs[1:]
+            state.queue.extend(rest)
+
+            # Fetch stream URL if not available (playlist flat items)
+            if not first.get('url'):
+                try:
+                    first['url'] = await self.fetch_stream_url(first['webpage_url'])
+                except Exception as e:
+                    await interaction.followup.send(f'❌ 無法取得串流：{e}')
+                    return
+
+            state.current = first
+
+            try:
+                source = make_source(first['url'], state.volume)
+                vc.play(source, after=lambda e: self._after_play(e, interaction.guild_id, vc))
+                log.info(f'開始播放: {first["title"]}')
+            except Exception as e:
+                log.error(f'播放失敗: {e}')
+                await interaction.followup.send(f'❌ 播放失敗：{e}')
+                return
+
+            embed = self.song_embed('🎵 正在播放', first, discord.Color.blue())
+            if rest:
+                embed.set_footer(text=f'播放清單中還有 {len(rest)} 首歌曲已加入隊列')
+            await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name='pause', description='暫停播放')
+    async def pause(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if vc and vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message('⏸️ 已暫停')
+        else:
+            await interaction.response.send_message('❌ 目前沒有在播放', ephemeral=True)
+
+    @app_commands.command(name='resume', description='繼續播放')
+    async def resume(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if vc and vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message('▶️ 繼續播放')
+        else:
+            await interaction.response.send_message('❌ 目前沒有暫停', ephemeral=True)
+
+    @app_commands.command(name='skip', description='跳過目前歌曲')
+    async def skip(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+            await interaction.response.send_message('⏭️ 已跳過')
+        else:
+            await interaction.response.send_message('❌ 目前沒有在播放', ephemeral=True)
+
+    @app_commands.command(name='stop', description='停止播放並清空隊列')
+    async def stop(self, interaction: discord.Interaction):
+        state = self.get_state(interaction.guild_id)
+        vc = interaction.guild.voice_client
+
+        state.queue.clear()
+        state.current = None
+
+        if vc:
+            vc.stop()
+            await vc.disconnect()
+
+        await interaction.response.send_message('⏹️ 已停止並斷開連接')
+
+    @app_commands.command(name='queue', description='查看播放隊列')
+    async def show_queue(self, interaction: discord.Interaction):
+        state = self.get_state(interaction.guild_id)
+        embed = discord.Embed(title='🎵 播放隊列', color=discord.Color.purple())
+
+        if state.current:
+            embed.add_field(
+                name='🎶 正在播放',
+                value=f'[{state.current["title"]}]({state.current["webpage_url"]}) `{self.fmt_duration(state.current["duration"])}`',
+                inline=False,
+            )
+
+        if state.queue:
+            lines = [
+                f'`{i}.` [{s["title"]}]({s["webpage_url"]}) `{self.fmt_duration(s["duration"])}`'
+                for i, s in enumerate(state.queue[:10], 1)
+            ]
+            if len(state.queue) > 10:
+                lines.append(f'*... 還有 {len(state.queue) - 10} 首*')
+            embed.add_field(name='📋 待播清單', value='\n'.join(lines), inline=False)
+        elif not state.current:
+            embed.description = '隊列是空的，用 `/play` 來新增音樂！'
+        else:
+            embed.add_field(name='📋 待播清單', value='空的', inline=False)
+
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name='nowplaying', description='查看目前播放的歌曲')
+    async def nowplaying(self, interaction: discord.Interaction):
+        state = self.get_state(interaction.guild_id)
+        if not state.current:
+            await interaction.response.send_message('❌ 目前沒有在播放', ephemeral=True)
+            return
+
+        song = state.current
+        embed = discord.Embed(
+            title='🎵 正在播放',
+            description=f'[{song["title"]}]({song["webpage_url"]})',
+            color=discord.Color.blue(),
+        )
+        embed.add_field(name='長度', value=self.fmt_duration(song['duration']))
+        if song['uploader']:
+            embed.add_field(name='頻道', value=song['uploader'])
+        if song['thumbnail']:
+            embed.set_image(url=song['thumbnail'])
+
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name='volume', description='調整音量 (0-100)')
+    @app_commands.describe(level='音量大小 (0-100)')
+    async def volume(self, interaction: discord.Interaction, level: int):
+        if not 0 <= level <= 100:
+            await interaction.response.send_message('❌ 音量必須在 0 到 100 之間', ephemeral=True)
+            return
+
+        state = self.get_state(interaction.guild_id)
+        state.volume = level / 100
+
+        vc = interaction.guild.voice_client
+        if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
+            vc.source.volume = state.volume
+
+        await interaction.response.send_message(f'🔊 音量已設定為 **{level}%**')
+
+    @app_commands.command(name='disconnect', description='讓 Bot 離開語音頻道')
+    async def disconnect(self, interaction: discord.Interaction):
+        vc = interaction.guild.voice_client
+        if vc:
+            state = self.get_state(interaction.guild_id)
+            state.queue.clear()
+            state.current = None
+            vc.stop()
+            await vc.disconnect()
+            await interaction.response.send_message('👋 已離開語音頻道')
+        else:
+            await interaction.response.send_message('❌ Bot 不在語音頻道中', ephemeral=True)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(MusicCog(bot))

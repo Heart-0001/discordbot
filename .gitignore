@@ -1,0 +1,21 @@
+# 環境變數（含 Token）
+.env
+
+# SSH 金鑰
+*.key
+*.pem
+
+# Log 檔
+*.log
+
+# Python 快取
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+
+# Claude 設定
+.claude/
