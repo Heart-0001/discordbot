@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import sys
 from typing import Optional
 
@@ -33,6 +34,7 @@ class GuildMusicState:
         self.queue: list[dict] = []
         self.current: Optional[dict] = None
         self.volume: float = 0.5
+        self.autoplay: bool = False
 
 
 class MusicCog(commands.Cog):
@@ -135,11 +137,39 @@ class MusicCog(commands.Cog):
             self._play_next(guild_id, voice_client), self.bot.loop
         )
 
+    async def _get_autoplay_songs(self, webpage_url: str) -> list[dict]:
+        """根據目前歌曲取得 YouTube 推薦的下一首。"""
+        match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', webpage_url)
+        if not match:
+            return []
+        video_id = match.group(1)
+        mix_url = f'https://www.youtube.com/watch?v={video_id}&list=RD{video_id}&start_radio=1'
+        try:
+            out = await self._run_ytdlp([
+                sys.executable, '-m', 'yt_dlp',
+                '--flat-playlist', '--dump-json', '--quiet', '--no-warnings',
+                '--playlist-items', '2:4',  # 跳過第一首（當前歌），抓接下來 3 首
+                mix_url,
+            ], timeout=20)
+            return self._parse_ytdlp_lines(out, stream_url=False)
+        except Exception as e:
+            log.error(f'Autoplay 取得推薦失敗: {e}')
+            return []
+
     async def _play_next(self, guild_id: int, voice_client: discord.VoiceClient):
         if not voice_client.is_connected():
             return
 
         state = self.get_state(guild_id)
+
+        # 隊列空了且 autoplay 開啟，自動抓推薦歌曲
+        if not state.queue and state.autoplay and state.current:
+            log.info('Autoplay: 抓取推薦歌曲...')
+            new_songs = await self._get_autoplay_songs(state.current['webpage_url'])
+            if new_songs:
+                state.queue.extend(new_songs)
+                log.info(f'Autoplay: 加入 {len(new_songs)} 首推薦歌曲')
+
         if not state.queue:
             state.current = None
             return
@@ -374,6 +404,13 @@ class MusicCog(commands.Cog):
             vc.source.volume = state.volume
 
         await interaction.response.send_message(f'🔊 音量已設定為 **{level}%**')
+
+    @app_commands.command(name='autoplay', description='開啟/關閉自動播放（根據當前歌曲推薦）')
+    async def autoplay(self, interaction: discord.Interaction):
+        state = self.get_state(interaction.guild_id)
+        state.autoplay = not state.autoplay
+        status = '✅ 開啟' if state.autoplay else '❌ 關閉'
+        await interaction.response.send_message(f'🔀 自動播放已 **{status}**')
 
     @app_commands.command(name='disconnect', description='讓 Bot 離開語音頻道')
     async def disconnect(self, interaction: discord.Interaction):
