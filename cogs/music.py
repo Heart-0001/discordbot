@@ -148,7 +148,7 @@ class MusicCog(commands.Cog):
             out = await self._run_ytdlp([
                 sys.executable, '-m', 'yt_dlp',
                 '--flat-playlist', '--dump-json', '--quiet', '--no-warnings',
-                '--playlist-items', '2:4',  # 跳過第一首（當前歌），抓接下來 3 首
+                '--playlist-items', '2:2',  # 跳過第一首（當前歌），只抓下一首
                 mix_url,
             ], timeout=20)
             return self._parse_ytdlp_lines(out, stream_url=False)
@@ -404,6 +404,32 @@ class MusicCog(commands.Cog):
             vc.source.volume = state.volume
 
         await interaction.response.send_message(f'🔊 音量已設定為 **{level}%**')
+
+    @app_commands.command(name='remove', description='從隊列移除歌曲（單首或範圍）')
+    @app_commands.describe(start='要移除的位置（從 1 開始）', end='範圍結尾（不填就只移除單首）')
+    async def remove(self, interaction: discord.Interaction, start: int, end: Optional[int] = None):
+        state = self.get_state(interaction.guild_id)
+        q = state.queue
+
+        if not q:
+            await interaction.response.send_message('❌ 隊列是空的', ephemeral=True)
+            return
+
+        end = end or start
+        if start < 1 or end > len(q) or start > end:
+            await interaction.response.send_message(
+                f'❌ 範圍無效，隊列目前有 **{len(q)}** 首', ephemeral=True)
+            return
+
+        removed = q[start - 1:end]
+        del q[start - 1:end]
+
+        if len(removed) == 1:
+            msg = f'🗑️ 已移除：**{removed[0]["title"]}**'
+        else:
+            msg = f'🗑️ 已移除第 {start} 到 {end} 首，共 **{len(removed)}** 首'
+
+        await interaction.response.send_message(msg)
 
     @app_commands.command(name='autoplay', description='開啟/關閉自動播放（根據當前歌曲推薦）')
     async def autoplay(self, interaction: discord.Interaction):

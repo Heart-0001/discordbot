@@ -27,7 +27,10 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
+    # 同步到每個伺服器（即時生效，不用等 1 小時）
+    for guild in bot.guilds:
+        await bot.tree.sync(guild=guild)
+        log.info(f'已同步指令到伺服器: {guild.name}')
     log.info(f'✅ {bot.user} 已上線！連接到 {len(bot.guilds)} 個伺服器')
 
 
