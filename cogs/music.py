@@ -35,6 +35,7 @@ class GuildMusicState:
         self.current: Optional[dict] = None
         self.volume: float = 0.5
         self.autoplay: bool = False
+        self.history: list[str] = []  # 最近播過的 webpage_url（避免 autoplay 重複）
 
 
 class MusicCog(commands.Cog):
@@ -103,7 +104,7 @@ class MusicCog(commands.Cog):
             ], timeout=30)
             results = self._parse_ytdlp_lines(out, stream_url=False)
         else:
-            search_query = query if is_url else f'ytsearch1:{query}'
+            search_query = query if is_url else f'ytmsearch1:{query}'
             out = await self._run_ytdlp([
                 sys.executable, '-m', 'yt_dlp',
                 '--dump-json', '--quiet', '--no-warnings',
@@ -137,21 +138,26 @@ class MusicCog(commands.Cog):
             self._play_next(guild_id, voice_client), self.bot.loop
         )
 
-    async def _get_autoplay_songs(self, webpage_url: str) -> list[dict]:
-        """根據目前歌曲取得 YouTube 推薦的下一首。"""
+    async def _get_autoplay_songs(self, webpage_url: str, history: list[str]) -> list[dict]:
+        """根據目前歌曲取得 YouTube 推薦的下一首（跳過已播過的）。"""
         match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', webpage_url)
         if not match:
             return []
         video_id = match.group(1)
         mix_url = f'https://www.youtube.com/watch?v={video_id}&list=RD{video_id}&start_radio=1'
         try:
+            # 多抓幾首備用，才能過濾掉已播過的
             out = await self._run_ytdlp([
                 sys.executable, '-m', 'yt_dlp',
                 '--flat-playlist', '--dump-json', '--quiet', '--no-warnings',
-                '--playlist-items', '2:2',  # 跳過第一首（當前歌），只抓下一首
+                '--playlist-items', '2:8',
                 mix_url,
             ], timeout=20)
-            return self._parse_ytdlp_lines(out, stream_url=False)
+            candidates = self._parse_ytdlp_lines(out, stream_url=False)
+            # 過濾掉最近播過的歌
+            history_set = set(history)
+            filtered = [s for s in candidates if s['webpage_url'] not in history_set]
+            return filtered[:1] if filtered else candidates[:1]
         except Exception as e:
             log.error(f'Autoplay 取得推薦失敗: {e}')
             return []
@@ -165,10 +171,10 @@ class MusicCog(commands.Cog):
         # 隊列空了且 autoplay 開啟，自動抓推薦歌曲
         if not state.queue and state.autoplay and state.current:
             log.info('Autoplay: 抓取推薦歌曲...')
-            new_songs = await self._get_autoplay_songs(state.current['webpage_url'])
+            new_songs = await self._get_autoplay_songs(state.current['webpage_url'], state.history)
             if new_songs:
                 state.queue.extend(new_songs)
-                log.info(f'Autoplay: 加入 {len(new_songs)} 首推薦歌曲')
+                log.info(f'Autoplay: 加入推薦歌曲: {new_songs[0]["title"]}')
 
         if not state.queue:
             state.current = None
@@ -190,6 +196,11 @@ class MusicCog(commands.Cog):
             source = make_source(next_song['url'], state.volume)
             voice_client.play(source, after=lambda e: self._after_play(e, guild_id, voice_client))
             log.info(f'開始播放: {next_song["title"]}')
+            # 記錄播放歷史（最多保留 20 首）
+            if next_song.get('webpage_url'):
+                state.history.append(next_song['webpage_url'])
+                if len(state.history) > 20:
+                    state.history.pop(0)
             # 預先在背景抓好下一首的串流 URL，減少換歌延遲
             if state.queue and not state.queue[0].get('url'):
                 asyncio.ensure_future(self._prefetch_next(state))
