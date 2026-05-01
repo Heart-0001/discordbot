@@ -180,6 +180,12 @@ class MusicCog(commands.Cog):
             self._play_next(guild_id, voice_client), self.bot.loop
         )
 
+    @staticmethod
+    def _extract_vid(url: str) -> str:
+        """從 YouTube / YouTube Music URL 取出 video ID，用於比對歷史。"""
+        m = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url or '')
+        return m.group(1) if m else url
+
     async def _get_autoplay_songs(self, webpage_url: str, history: list[str]) -> list[dict]:
         """根據目前歌曲取得 YouTube 推薦的下一首（跳過已播過的）。"""
         match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', webpage_url)
@@ -196,9 +202,9 @@ class MusicCog(commands.Cog):
                 mix_url,
             ], timeout=20)
             candidates = self._parse_ytdlp_lines(out, stream_url=False)
-            # 過濾掉最近播過的歌
-            history_set = set(history)
-            filtered = [s for s in candidates if s['webpage_url'] not in history_set]
+            # 用 video ID 比對歷史（避免 youtube.com vs music.youtube.com URL 不同但同首歌）
+            history_ids = {self._extract_vid(h) for h in history}
+            filtered = [s for s in candidates if self._extract_vid(s['webpage_url']) not in history_ids]
             return filtered[:1] if filtered else candidates[:1]
         except Exception as e:
             log.error(f'Autoplay 取得推薦失敗: {e}')
@@ -222,7 +228,13 @@ class MusicCog(commands.Cog):
 
             # 2. 用標題去 YouTube Music 找音源版
             ytm = await self._ytmusic_search(candidate['title'])
-            song = ytm[0] if ytm else candidate
+            if ytm:
+                # 確認 YTMusic 結果不是已播過的歌（video ID 比對）
+                ytm_vid = self._extract_vid(ytm[0].get('webpage_url', ''))
+                history_ids = {self._extract_vid(h) for h in state.history}
+                song = ytm[0] if ytm_vid not in history_ids else candidate
+            else:
+                song = candidate
             log.info(f'Autoplay 預載: {"YTMusic" if ytm else "YouTube"} → {song["title"]}')
 
             # 3. 抓串流 URL
