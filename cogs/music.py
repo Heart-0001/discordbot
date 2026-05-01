@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import sys
+import urllib.parse
 from typing import Optional
 
 import discord
@@ -88,8 +89,34 @@ class MusicCog(commands.Cog):
                 continue
         return results
 
+    async def _ytmusic_search(self, query: str) -> list[dict]:
+        """從 YouTube Music 搜尋，回傳第一個結果；失敗回傳空串列。"""
+        try:
+            encoded = urllib.parse.quote(query)
+            out = await self._run_ytdlp([
+                sys.executable, '-m', 'yt_dlp',
+                '--flat-playlist', '--dump-json', '--quiet', '--no-warnings',
+                '--playlist-items', '1',
+                f'https://music.youtube.com/search?q={encoded}',
+            ], timeout=15)
+            results = self._parse_ytdlp_lines(out, stream_url=False)
+            if results:
+                log.info(f'YouTube Music 結果: {results[0]["title"]}')
+            return results[:1]
+        except Exception as e:
+            log.info(f'YouTube Music 搜尋失敗 (退回 YouTube): {e}')
+            return []
+
     async def fetch_info(self, query: str) -> list[dict]:
         is_url = query.startswith('http')
+
+        # Radio Mix URL (list=RD...) → 只播 v= 那首影片，autoplay 會自己接推薦
+        if is_url and re.search(r'[?&]list=RD', query):
+            m = re.search(r'[?&]v=([a-zA-Z0-9_-]{11})', query)
+            if m:
+                query = f'https://www.youtube.com/watch?v={m.group(1)}'
+                log.info(f'Radio Mix URL → 只播單首: {query}')
+
         is_playlist = is_url and 'list=' in query
 
         log.info(f'fetch_info 開始: {query[:80]}')
@@ -104,16 +131,30 @@ class MusicCog(commands.Cog):
             ], timeout=30)
             results = self._parse_ytdlp_lines(out, stream_url=False)
         else:
-            search_query = query if is_url else f'ytsearch1:{query} official audio'
-            out = await self._run_ytdlp([
-                sys.executable, '-m', 'yt_dlp',
-                '--dump-json', '--quiet', '--no-warnings',
-                '--no-playlist',
-                '--format', 'bestaudio[abr<=96]/bestaudio/best',
-                '--ffmpeg-location', FFMPEG_PATH,
-                search_query,
-            ], timeout=30)
-            results = self._parse_ytdlp_lines(out, stream_url=True)
+            if is_url:
+                # 直接抓指定 URL
+                out = await self._run_ytdlp([
+                    sys.executable, '-m', 'yt_dlp',
+                    '--dump-json', '--quiet', '--no-warnings',
+                    '--no-playlist',
+                    '--format', 'bestaudio[abr<=96]/bestaudio/best',
+                    '--ffmpeg-location', FFMPEG_PATH,
+                    query,
+                ], timeout=30)
+                results = self._parse_ytdlp_lines(out, stream_url=True)
+            else:
+                # 優先用 YouTube Music（音源導向），失敗才退回 YouTube
+                results = await self._ytmusic_search(query)
+                if not results:
+                    out = await self._run_ytdlp([
+                        sys.executable, '-m', 'yt_dlp',
+                        '--dump-json', '--quiet', '--no-warnings',
+                        '--no-playlist',
+                        '--format', 'bestaudio[abr<=96]/bestaudio/best',
+                        '--ffmpeg-location', FFMPEG_PATH,
+                        f'ytsearch1:{query}',
+                    ], timeout=30)
+                    results = self._parse_ytdlp_lines(out, stream_url=True)
 
         log.info(f'fetch_info 完成: {len(results)} 首')
         return results
