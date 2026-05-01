@@ -36,7 +36,8 @@ class GuildMusicState:
         self.current: Optional[dict] = None
         self.volume: float = 0.5
         self.autoplay: bool = False
-        self.history: list[str] = []       # 最近播過的 webpage_url（避免 autoplay 重複）
+        self.history: list[str] = []        # 最近播過的 webpage_url（供 Radio Mix 用）
+        self.history_titles: set[str] = set()  # 正規化標題集合（防重複核心比對）
         self.autoplay_prefetch: Optional[dict] = None  # 預載好的下一首（含串流 URL）
 
 
@@ -186,7 +187,7 @@ class MusicCog(commands.Cog):
         m = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url or '')
         return m.group(1) if m else url
 
-    async def _get_autoplay_songs(self, webpage_url: str, history: list[str]) -> list[dict]:
+    async def _get_autoplay_songs(self, webpage_url: str, history_titles: set[str]) -> list[dict]:
         """根據目前歌曲取得 YouTube 推薦的下一首（跳過已播過的）。"""
         match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', webpage_url)
         if not match:
@@ -194,7 +195,6 @@ class MusicCog(commands.Cog):
         video_id = match.group(1)
         mix_url = f'https://www.youtube.com/watch?v={video_id}&list=RD{video_id}&start_radio=1'
         try:
-            # 多抓幾首備用，才能過濾掉已播過的
             out = await self._run_ytdlp([
                 sys.executable, '-m', 'yt_dlp',
                 '--flat-playlist', '--dump-json', '--quiet', '--no-warnings',
@@ -202,9 +202,8 @@ class MusicCog(commands.Cog):
                 mix_url,
             ], timeout=20)
             candidates = self._parse_ytdlp_lines(out, stream_url=False)
-            # 用 video ID 比對歷史（避免 youtube.com vs music.youtube.com URL 不同但同首歌）
-            history_ids = {self._extract_vid(h) for h in history}
-            filtered = [s for s in candidates if self._extract_vid(s['webpage_url']) not in history_ids]
+            # 用標題比對歷史（最簡單可靠，避免同歌不同 ID/URL 的問題）
+            filtered = [s for s in candidates if s['title'].lower().strip() not in history_titles]
             return filtered[:1] if filtered else candidates[:1]
         except Exception as e:
             log.error(f'Autoplay 取得推薦失敗: {e}')
@@ -220,7 +219,7 @@ class MusicCog(commands.Cog):
         try:
             # 1. 從 YouTube Mix 取得推薦
             candidates = await self._get_autoplay_songs(
-                state.current['webpage_url'], state.history
+                state.current['webpage_url'], state.history_titles
             )
             if not candidates:
                 return
@@ -229,10 +228,9 @@ class MusicCog(commands.Cog):
             # 2. 用標題去 YouTube Music 找音源版
             ytm = await self._ytmusic_search(candidate['title'])
             if ytm:
-                # 確認 YTMusic 結果不是已播過的歌（video ID 比對）
-                ytm_vid = self._extract_vid(ytm[0].get('webpage_url', ''))
-                history_ids = {self._extract_vid(h) for h in state.history}
-                song = ytm[0] if ytm_vid not in history_ids else candidate
+                # 確認 YTMusic 結果不是已播過的歌（標題比對）
+                ytm_title = ytm[0]['title'].lower().strip()
+                song = ytm[0] if ytm_title not in state.history_titles else candidate
             else:
                 song = candidate
             log.info(f'Autoplay 預載: {"YTMusic" if ytm else "YouTube"} → {song["title"]}')
@@ -263,7 +261,7 @@ class MusicCog(commands.Cog):
                 # 來不及預載，即時抓（備用路徑）
                 log.info('Autoplay: 即時抓取推薦...')
                 new_songs = await self._get_autoplay_songs(
-                    state.current['webpage_url'], state.history
+                    state.current['webpage_url'], state.history_titles
                 )
                 if new_songs:
                     state.queue.extend(new_songs)
@@ -294,6 +292,8 @@ class MusicCog(commands.Cog):
                 state.history.append(next_song['webpage_url'])
                 if len(state.history) > 20:
                     state.history.pop(0)
+            if next_song.get('title'):
+                state.history_titles.add(next_song['title'].lower().strip())
             # 歌開始播就立刻在背景預載下一首
             if state.autoplay and not state.queue and not state.autoplay_prefetch:
                 asyncio.ensure_future(self._prefetch_autoplay(guild_id))
@@ -399,6 +399,8 @@ class MusicCog(commands.Cog):
                     state.history.append(first['webpage_url'])
                     if len(state.history) > 20:
                         state.history.pop(0)
+                if first.get('title'):
+                    state.history_titles.add(first['title'].lower().strip())
                 # 歌開始播就立刻預載 autoplay 下一首
                 if state.autoplay and not state.queue and not state.autoplay_prefetch:
                     asyncio.ensure_future(self._prefetch_autoplay(interaction.guild_id))
@@ -602,6 +604,7 @@ class MusicCog(commands.Cog):
             state.current = None
             state.autoplay_prefetch = None
             state.history.clear()
+            state.history_titles.clear()
             vc.stop()
             await vc.disconnect()
             await interaction.response.send_message('👋 已離開語音頻道')
