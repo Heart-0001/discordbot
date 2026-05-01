@@ -104,7 +104,7 @@ class MusicCog(commands.Cog):
             ], timeout=30)
             results = self._parse_ytdlp_lines(out, stream_url=False)
         else:
-            search_query = query if is_url else f'ytmsearch1:{query}'
+            search_query = query if is_url else f'ytsearch1:{query} official audio'
             out = await self._run_ytdlp([
                 sys.executable, '-m', 'yt_dlp',
                 '--dump-json', '--quiet', '--no-warnings',
