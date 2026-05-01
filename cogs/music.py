@@ -36,7 +36,8 @@ class GuildMusicState:
         self.current: Optional[dict] = None
         self.volume: float = 0.5
         self.autoplay: bool = False
-        self.history: list[str] = []  # 最近播過的 webpage_url（避免 autoplay 重複）
+        self.history: list[str] = []       # 最近播過的 webpage_url（避免 autoplay 重複）
+        self.autoplay_prefetch: Optional[dict] = None  # 預載好的下一首（含串流 URL）
 
 
 class MusicCog(commands.Cog):
@@ -203,19 +204,55 @@ class MusicCog(commands.Cog):
             log.error(f'Autoplay 取得推薦失敗: {e}')
             return []
 
+    async def _prefetch_autoplay(self, guild_id: int):
+        """趁目前歌曲還在播，背景預載下一首 autoplay（含 YTMusic 音源 + 串流 URL）。"""
+        state = self.get_state(guild_id)
+        if state.autoplay_prefetch:
+            return  # 已有預載，不重複
+        try:
+            # 1. 從 YouTube Mix 取得推薦
+            candidates = await self._get_autoplay_songs(
+                state.current['webpage_url'], state.history
+            )
+            if not candidates:
+                return
+            candidate = candidates[0]
+
+            # 2. 用標題去 YouTube Music 找音源版
+            ytm = await self._ytmusic_search(candidate['title'])
+            song = ytm[0] if ytm else candidate
+            log.info(f'Autoplay 預載: {"YTMusic" if ytm else "YouTube"} → {song["title"]}')
+
+            # 3. 抓串流 URL
+            if not song.get('url'):
+                song['url'] = await self.fetch_stream_url(song['webpage_url'])
+
+            state.autoplay_prefetch = song
+            log.info(f'Autoplay 預載完成: {song["title"]}')
+        except Exception as e:
+            log.error(f'Autoplay 預載失敗: {e}')
+
     async def _play_next(self, guild_id: int, voice_client: discord.VoiceClient):
         if not voice_client.is_connected():
             return
 
         state = self.get_state(guild_id)
 
-        # 隊列空了且 autoplay 開啟，自動抓推薦歌曲
+        # 隊列空了且 autoplay 開啟
         if not state.queue and state.autoplay and state.current:
-            log.info('Autoplay: 抓取推薦歌曲...')
-            new_songs = await self._get_autoplay_songs(state.current['webpage_url'], state.history)
-            if new_songs:
-                state.queue.extend(new_songs)
-                log.info(f'Autoplay: 加入推薦歌曲: {new_songs[0]["title"]}')
+            if state.autoplay_prefetch:
+                # 預載好了，直接用（零等待）
+                log.info('Autoplay: 使用預載歌曲')
+                state.queue.append(state.autoplay_prefetch)
+                state.autoplay_prefetch = None
+            else:
+                # 來不及預載，即時抓（備用路徑）
+                log.info('Autoplay: 即時抓取推薦...')
+                new_songs = await self._get_autoplay_songs(
+                    state.current['webpage_url'], state.history
+                )
+                if new_songs:
+                    state.queue.extend(new_songs)
 
         if not state.queue:
             state.current = None
@@ -223,13 +260,14 @@ class MusicCog(commands.Cog):
 
         next_song = state.queue.pop(0)
 
-        # Always fetch fresh stream URL (flat-playlist items have empty url)
-        try:
-            next_song['url'] = await self.fetch_stream_url(next_song['webpage_url'])
-        except Exception as e:
-            log.error(f'重新取得 URL 失敗，跳過: {e}')
-            await self._play_next(guild_id, voice_client)
-            return
+        # 取得串流 URL（預載的歌已有，flat 結果沒有）
+        if not next_song.get('url'):
+            try:
+                next_song['url'] = await self.fetch_stream_url(next_song['webpage_url'])
+            except Exception as e:
+                log.error(f'重新取得 URL 失敗，跳過: {e}')
+                await self._play_next(guild_id, voice_client)
+                return
 
         state.current = next_song
 
@@ -242,8 +280,10 @@ class MusicCog(commands.Cog):
                 state.history.append(next_song['webpage_url'])
                 if len(state.history) > 20:
                     state.history.pop(0)
-            # 預先在背景抓好下一首的串流 URL，減少換歌延遲
-            if state.queue and not state.queue[0].get('url'):
+            # 歌開始播就立刻在背景預載下一首
+            if state.autoplay and not state.queue and not state.autoplay_prefetch:
+                asyncio.ensure_future(self._prefetch_autoplay(guild_id))
+            elif state.queue and not state.queue[0].get('url'):
                 asyncio.ensure_future(self._prefetch_next(state))
         except Exception as e:
             log.error(f'播放失敗: {e}')
@@ -340,6 +380,9 @@ class MusicCog(commands.Cog):
                 source = make_source(first['url'], state.volume)
                 vc.play(source, after=lambda e: self._after_play(e, interaction.guild_id, vc))
                 log.info(f'開始播放: {first["title"]}')
+                # 歌開始播就立刻預載 autoplay 下一首
+                if state.autoplay and not state.queue and not state.autoplay_prefetch:
+                    asyncio.ensure_future(self._prefetch_autoplay(interaction.guild_id))
             except Exception as e:
                 log.error(f'播放失敗: {e}')
                 await interaction.followup.send(f'❌ 播放失敗：{e}')
@@ -372,24 +415,26 @@ class MusicCog(commands.Cog):
     async def skip(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
+            # 跳歌時清掉舊的預載，讓新的歌重新預載推薦
+            self.get_state(interaction.guild_id).autoplay_prefetch = None
             vc.stop()
             await interaction.response.send_message('⏭️ 已跳過')
         else:
             await interaction.response.send_message('❌ 目前沒有在播放', ephemeral=True)
 
-    @app_commands.command(name='stop', description='停止播放並清空隊列')
+    @app_commands.command(name='stop', description='停止播放並清空隊列（留在頻道）')
     async def stop(self, interaction: discord.Interaction):
         state = self.get_state(interaction.guild_id)
         vc = interaction.guild.voice_client
 
         state.queue.clear()
         state.current = None
+        state.autoplay_prefetch = None
 
         if vc:
             vc.stop()
-            await vc.disconnect()
 
-        await interaction.response.send_message('⏹️ 已停止並斷開連接')
+        await interaction.response.send_message('⏹️ 已停止並清空隊列')
 
     @app_commands.command(name='queue', description='查看播放隊列')
     async def show_queue(self, interaction: discord.Interaction):
@@ -417,6 +462,11 @@ class MusicCog(commands.Cog):
             embed.description = (embed.description or '') + '\n\n**📋 待播清單**\n' + '\n'.join(lines)
         elif not state.current:
             embed.description = '隊列是空的，用 `/play` 來新增音樂！'
+
+        # autoplay 預載提示（排在使用者 queue 之後）
+        if state.autoplay_prefetch:
+            t = state.autoplay_prefetch['title'][:45] + '…' if len(state.autoplay_prefetch['title']) > 45 else state.autoplay_prefetch['title']
+            embed.description = (embed.description or '') + f'\n\n🔀 **Autoplay 下一首**\n{t}'
 
         await interaction.response.send_message(embed=embed)
 
@@ -489,6 +539,40 @@ class MusicCog(commands.Cog):
         state.autoplay = not state.autoplay
         status = '✅ 開啟' if state.autoplay else '❌ 關閉'
         await interaction.response.send_message(f'🔀 自動播放已 **{status}**')
+        # 剛開啟時，如果歌正在播且 queue 空，立刻開始預載
+        if state.autoplay and state.current and not state.queue and not state.autoplay_prefetch:
+            asyncio.ensure_future(self._prefetch_autoplay(interaction.guild_id))
+
+    @app_commands.command(name='skipautoplay', description='跳過 Autoplay 預載的下一首，重新抓一首推薦')
+    async def skipautoplay(self, interaction: discord.Interaction):
+        state = self.get_state(interaction.guild_id)
+
+        if not state.autoplay:
+            await interaction.response.send_message('❌ Autoplay 目前是關閉的', ephemeral=True)
+            return
+        if not state.current:
+            await interaction.response.send_message('❌ 目前沒有在播放', ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        # 清掉舊的預載，加目前那首到 history 讓下一首不重複
+        old = state.autoplay_prefetch
+        state.autoplay_prefetch = None
+        if old and old.get('webpage_url'):
+            state.history.append(old['webpage_url'])
+            if len(state.history) > 20:
+                state.history.pop(0)
+
+        # 重新預載
+        await self._prefetch_autoplay(interaction.guild_id)
+
+        if state.autoplay_prefetch:
+            t = state.autoplay_prefetch['title']
+            url = state.autoplay_prefetch.get('webpage_url', '')
+            await interaction.followup.send(f'🔀 已換掉，Autoplay 下一首改為：\n**[{t}]({url})**')
+        else:
+            await interaction.followup.send('⚠️ 找不到新的推薦，queue 空了之後會再試一次')
 
     @app_commands.command(name='disconnect', description='讓 Bot 離開語音頻道')
     async def disconnect(self, interaction: discord.Interaction):
