@@ -209,6 +209,8 @@ class MusicCog(commands.Cog):
         state = self.get_state(guild_id)
         if state.autoplay_prefetch:
             return  # 已有預載，不重複
+        if not state.current:
+            return  # 歌已停止，不需要預載
         try:
             # 1. 從 YouTube Mix 取得推薦
             candidates = await self._get_autoplay_songs(
@@ -380,6 +382,11 @@ class MusicCog(commands.Cog):
                 source = make_source(first['url'], state.volume)
                 vc.play(source, after=lambda e: self._after_play(e, interaction.guild_id, vc))
                 log.info(f'開始播放: {first["title"]}')
+                # 第一首也要加進 history，避免 autoplay 重複推薦
+                if first.get('webpage_url'):
+                    state.history.append(first['webpage_url'])
+                    if len(state.history) > 20:
+                        state.history.pop(0)
                 # 歌開始播就立刻預載 autoplay 下一首
                 if state.autoplay and not state.queue and not state.autoplay_prefetch:
                     asyncio.ensure_future(self._prefetch_autoplay(interaction.guild_id))
@@ -581,6 +588,8 @@ class MusicCog(commands.Cog):
             state = self.get_state(interaction.guild_id)
             state.queue.clear()
             state.current = None
+            state.autoplay_prefetch = None
+            state.history.clear()
             vc.stop()
             await vc.disconnect()
             await interaction.response.send_message('👋 已離開語音頻道')
