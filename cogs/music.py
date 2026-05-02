@@ -1,14 +1,15 @@
 import asyncio
 import json
 import logging
+import random
 import re
 import sys
-import urllib.parse
 from typing import Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+from ytmusicapi import YTMusic
 
 log = logging.getLogger(__name__)
 
@@ -16,6 +17,13 @@ FFMPEG_PATH = r'C:\Users\Heart\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmp
 
 FFMPEG_BEFORE_OPTS = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -thread_queue_size 4096 -probesize 32'
 FFMPEG_OPTS = '-vn -b:a 96k'  # 限制輸出 96kbps，符合 Discord 上限
+
+# 搜尋評分：這些關鍵字出現在標題中代表不是原版官方音源，扣分
+_PENALIZED = re.compile(
+    r'\b(cover|カバー|翻唱|翻cover|karaoke|lyrics?|歌詞|字幕|live|remix|piano\s*ver|'
+    r'acoustic|fan.?made|instrumental|inst\.?|orchestra|orchestral|band\s*ver|tutorial)\b',
+    re.IGNORECASE,
+)
 
 
 def make_source(url: str, volume: float) -> discord.PCMVolumeTransformer:
@@ -45,6 +53,7 @@ class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._states: dict[int, GuildMusicState] = {}
+        self._ytm = YTMusic()  # 不需要登入，搜尋 + radio 皆可用
 
     def get_state(self, guild_id: int) -> GuildMusicState:
         if guild_id not in self._states:
@@ -91,23 +100,84 @@ class MusicCog(commands.Cog):
                 continue
         return results
 
-    async def _ytmusic_search(self, query: str) -> list[dict]:
-        """從 YouTube Music 搜尋，回傳第一個結果；失敗回傳空串列。"""
+    def _ytm_track_to_dict(self, r: dict) -> dict | None:
+        """把 ytmusicapi 的 track dict 轉成 bot 內部格式。"""
+        vid = r.get('videoId', '')
+        if not vid:
+            return None
+        artists = ', '.join(a['name'] for a in r.get('artists') or [])
+        thumbs = r.get('thumbnails') or []
+        thumb = thumbs[-1]['url'] if thumbs else ''
+        duration_s = r.get('duration_seconds') or 0
+        return {
+            'url': '',
+            'webpage_url': f'https://www.youtube.com/watch?v={vid}',
+            'title': r.get('title', 'Unknown'),
+            'duration': duration_s,
+            'thumbnail': thumb,
+            'uploader': artists,
+        }
+
+    async def _ytmusic_search(self, query: str, count: int = 5) -> list[dict]:
+        """用 ytmusicapi 在 YouTube Music 搜尋歌曲，回傳前 count 個候選。"""
         try:
-            encoded = urllib.parse.quote(query)
-            out = await self._run_ytdlp([
-                sys.executable, '-m', 'yt_dlp',
-                '--flat-playlist', '--dump-json', '--quiet', '--no-warnings',
-                '--playlist-items', '1',
-                f'https://music.youtube.com/search?q={encoded}',
-            ], timeout=15)
-            results = self._parse_ytdlp_lines(out, stream_url=False)
+            loop = asyncio.get_event_loop()
+            raw = await loop.run_in_executor(
+                None,
+                lambda: self._ytm.search(query, filter='songs', limit=count),
+            )
+            results = [self._ytm_track_to_dict(r) for r in (raw or [])]
+            results = [r for r in results if r][:count]
             if results:
-                log.info(f'YouTube Music 結果: {results[0]["title"]}')
-            return results[:1]
+                log.info(f'YouTube Music 候選: {[r["title"] for r in results]}')
+            return results
         except Exception as e:
-            log.info(f'YouTube Music 搜尋失敗 (退回 YouTube): {e}')
+            log.info(f'YouTube Music 搜尋失敗: {e}')
             return []
+
+    def _pick_best(self, results: list[dict], query: str) -> dict:
+        """
+        從 YouTube Music 多個候選中，用評分挑出最接近官方原版的結果。
+        評分維度：
+          +30  標題與查詢字詞的重疊比率（最高 30 分）
+          +15  頻道名含 official / vevo
+          +10  標題含「official」
+          + 5  標題含「audio」（純音樂版）
+          -20  標題含封面/卡拉OK/歌詞/Live/Remix 等不想要的標籤
+        """
+        query_words = set(re.findall(r'\w+', query.lower()))
+
+        def score(r: dict) -> float:
+            title = r.get('title', '').lower()
+            uploader = (r.get('uploader') or '').lower()
+            s = 0.0
+
+            # 標題與查詢字詞的重疊
+            title_words = set(re.findall(r'\w+', title))
+            if query_words:
+                s += len(query_words & title_words) / len(query_words) * 30
+
+            # 官方頻道
+            if any(k in uploader for k in ('official', 'vevo')):
+                s += 15
+
+            # 標題含 official
+            if 'official' in title:
+                s += 10
+
+            # 純音樂版
+            if 'audio' in title:
+                s += 5
+
+            # 扣分：封面/卡拉OK/歌詞/直播/Remix 等
+            if _PENALIZED.search(r.get('title', '')):
+                s -= 20
+
+            return s
+
+        best = max(results, key=score)
+        log.info(f'挑選結果: {best["title"]} (共 {len(results)} 個候選)')
+        return best
 
     async def fetch_info(self, query: str) -> list[dict]:
         is_url = query.startswith('http')
@@ -128,9 +198,8 @@ class MusicCog(commands.Cog):
             out = await self._run_ytdlp([
                 sys.executable, '-m', 'yt_dlp',
                 '--flat-playlist', '--dump-json', '--quiet', '--no-warnings',
-                '--playlist-items', '1:50',
                 query,
-            ], timeout=30)
+            ], timeout=60)
             results = self._parse_ytdlp_lines(out, stream_url=False)
         else:
             if is_url:
@@ -145,9 +214,13 @@ class MusicCog(commands.Cog):
                 ], timeout=30)
                 results = self._parse_ytdlp_lines(out, stream_url=True)
             else:
-                # 優先用 YouTube Music（音源導向），失敗才退回 YouTube
-                results = await self._ytmusic_search(query)
-                if not results:
+                # 優先用 YouTube Music，取多個候選並評分選最官方版本
+                candidates = await self._ytmusic_search(query, count=5)
+                if candidates:
+                    results = [self._pick_best(candidates, query)]
+                else:
+                    # YouTube Music 完全失敗才退回 YouTube 搜尋
+                    log.info('YouTube Music 失敗，退回 ytsearch1:')
                     out = await self._run_ytdlp([
                         sys.executable, '-m', 'yt_dlp',
                         '--dump-json', '--quiet', '--no-warnings',
@@ -188,57 +261,50 @@ class MusicCog(commands.Cog):
         return m.group(1) if m else url
 
     async def _get_autoplay_songs(self, webpage_url: str, history_titles: set[str]) -> list[dict]:
-        """根據目前歌曲取得 YouTube 推薦的下一首（跳過已播過的）。"""
+        """用 ytmusicapi get_watch_playlist(radio=True) 取得 YTMusic 推薦清單。"""
         match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', webpage_url)
         if not match:
             return []
         video_id = match.group(1)
-        mix_url = f'https://www.youtube.com/watch?v={video_id}&list=RD{video_id}&start_radio=1'
         try:
-            out = await self._run_ytdlp([
-                sys.executable, '-m', 'yt_dlp',
-                '--flat-playlist', '--dump-json', '--quiet', '--no-warnings',
-                '--playlist-items', '2:8',
-                mix_url,
-            ], timeout=20)
-            candidates = self._parse_ytdlp_lines(out, stream_url=False)
-            # 用標題比對歷史（最簡單可靠，避免同歌不同 ID/URL 的問題）
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(
+                None,
+                lambda: self._ytm.get_watch_playlist(videoId=video_id, radio=True, limit=10),
+            )
+            # tracks[0] 是目前在播的歌，從 [1:] 開始才是推薦
+            tracks = (data or {}).get('tracks', [])[1:]
+            candidates = [self._ytm_track_to_dict(r) for r in tracks]
+            candidates = [c for c in candidates if c]
+            # 標題比對歷史，過濾掉已播過的
             filtered = [s for s in candidates if s['title'].lower().strip() not in history_titles]
-            return filtered[:1] if filtered else candidates[:1]
+            result = filtered if filtered else candidates
+            return result[:1]
         except Exception as e:
             log.error(f'Autoplay 取得推薦失敗: {e}')
             return []
 
     async def _prefetch_autoplay(self, guild_id: int):
-        """趁目前歌曲還在播，背景預載下一首 autoplay（含 YTMusic 音源 + 串流 URL）。"""
+        """趁目前歌曲還在播，背景預載下一首 autoplay（含串流 URL）。
+        推薦直接來自 ytmusicapi get_watch_playlist(radio=True)，不需要二次搜尋。
+        """
         state = self.get_state(guild_id)
         if state.autoplay_prefetch:
             return  # 已有預載，不重複
         if not state.current:
             return  # 歌已停止，不需要預載
         try:
-            # 1. 從 YouTube Mix 取得推薦
+            # 1. 從 YTMusic 取得推薦
             candidates = await self._get_autoplay_songs(
                 state.current['webpage_url'], state.history_titles
             )
             if not candidates:
                 return
-            candidate = candidates[0]
+            song = candidates[0]
+            log.info(f'Autoplay 預載: {song["title"]}')
 
-            # 2. 用標題去 YouTube Music 找音源版
-            ytm = await self._ytmusic_search(candidate['title'])
-            if ytm:
-                # 確認 YTMusic 結果不是已播過的歌（標題比對）
-                ytm_title = ytm[0]['title'].lower().strip()
-                song = ytm[0] if ytm_title not in state.history_titles else candidate
-            else:
-                song = candidate
-            log.info(f'Autoplay 預載: {"YTMusic" if ytm else "YouTube"} → {song["title"]}')
-
-            # 3. 抓串流 URL
-            if not song.get('url'):
-                song['url'] = await self.fetch_stream_url(song['webpage_url'])
-
+            # 2. 抓串流 URL
+            song['url'] = await self.fetch_stream_url(song['webpage_url'])
             state.autoplay_prefetch = song
             log.info(f'Autoplay 預載完成: {song["title"]}')
         except Exception as e:
@@ -414,6 +480,139 @@ class MusicCog(commands.Cog):
                 embed.set_footer(text=f'播放清單中還有 {len(rest)} 首歌曲已加入隊列')
             await interaction.followup.send(embed=embed)
 
+    @app_commands.command(name='randomlist', description='播放清單但隨機打亂順序')
+    @app_commands.describe(query='YouTube 播放清單連結或歌曲名稱')
+    async def randomlist(self, interaction: discord.Interaction, query: str):
+        if not interaction.user.voice:
+            await interaction.response.send_message('❌ 請先加入一個語音頻道！', ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        vc = interaction.guild.voice_client
+        if vc is None:
+            vc = await interaction.user.voice.channel.connect()
+        elif vc.channel != interaction.user.voice.channel:
+            await vc.move_to(interaction.user.voice.channel)
+
+        state = self.get_state(interaction.guild_id)
+
+        try:
+            songs = await self.fetch_info(query)
+        except Exception as e:
+            await interaction.followup.send(f'❌ 無法取得音樂：{e}')
+            return
+
+        if not songs:
+            await interaction.followup.send('❌ 找不到音樂')
+            return
+
+        random.shuffle(songs)
+        log.info(f'隨機清單: {len(songs)} 首')
+
+        if vc.is_playing() or vc.is_paused():
+            state.queue.extend(songs)
+            embed = discord.Embed(
+                title='🔀 已隨機加入隊列',
+                description=f'打亂並加入了 **{len(songs)}** 首歌曲',
+                color=discord.Color.green(),
+            )
+            await interaction.followup.send(embed=embed)
+        else:
+            first, rest = songs[0], songs[1:]
+            state.queue.extend(rest)
+
+            if not first.get('url'):
+                try:
+                    first['url'] = await self.fetch_stream_url(first['webpage_url'])
+                except Exception as e:
+                    await interaction.followup.send(f'❌ 無法取得串流：{e}')
+                    return
+
+            state.current = first
+            try:
+                source = make_source(first['url'], state.volume)
+                vc.play(source, after=lambda e: self._after_play(e, interaction.guild_id, vc))
+                log.info(f'開始播放: {first["title"]}')
+                if first.get('webpage_url'):
+                    state.history.append(first['webpage_url'])
+                    if len(state.history) > 20:
+                        state.history.pop(0)
+                if first.get('title'):
+                    state.history_titles.add(first['title'].lower().strip())
+                if state.autoplay and not state.queue and not state.autoplay_prefetch:
+                    asyncio.ensure_future(self._prefetch_autoplay(interaction.guild_id))
+            except Exception as e:
+                await interaction.followup.send(f'❌ 播放失敗：{e}')
+                return
+
+            embed = self.song_embed('🔀 隨機播放', first, discord.Color.blue())
+            embed.set_footer(text=f'已隨機排列，還有 {len(rest)} 首在隊列中')
+            await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name='nextplay', description='插入歌曲到下一首播放')
+    @app_commands.describe(query='YouTube 連結或歌曲名稱關鍵字')
+    async def nextplay(self, interaction: discord.Interaction, query: str):
+        if not interaction.user.voice:
+            await interaction.response.send_message('❌ 請先加入一個語音頻道！', ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        vc = interaction.guild.voice_client
+        if vc is None:
+            vc = await interaction.user.voice.channel.connect()
+        elif vc.channel != interaction.user.voice.channel:
+            await vc.move_to(interaction.user.voice.channel)
+
+        state = self.get_state(interaction.guild_id)
+
+        try:
+            songs = await self.fetch_info(query)
+        except Exception as e:
+            await interaction.followup.send(f'❌ 無法取得音樂：{e}')
+            return
+
+        if not songs:
+            await interaction.followup.send('❌ 找不到音樂')
+            return
+
+        # 只取第一首插入到 queue 最前面
+        song = songs[0]
+
+        if vc.is_playing() or vc.is_paused():
+            state.queue.insert(0, song)
+            embed = self.song_embed('⏩ 插入為下一首', song, discord.Color.orange())
+            await interaction.followup.send(embed=embed)
+        else:
+            # 沒在播就直接播
+            if not song.get('url'):
+                try:
+                    song['url'] = await self.fetch_stream_url(song['webpage_url'])
+                except Exception as e:
+                    await interaction.followup.send(f'❌ 無法取得串流：{e}')
+                    return
+
+            state.current = song
+            try:
+                source = make_source(song['url'], state.volume)
+                vc.play(source, after=lambda e: self._after_play(e, interaction.guild_id, vc))
+                log.info(f'開始播放: {song["title"]}')
+                if song.get('webpage_url'):
+                    state.history.append(song['webpage_url'])
+                    if len(state.history) > 20:
+                        state.history.pop(0)
+                if song.get('title'):
+                    state.history_titles.add(song['title'].lower().strip())
+                if state.autoplay and not state.queue and not state.autoplay_prefetch:
+                    asyncio.ensure_future(self._prefetch_autoplay(interaction.guild_id))
+            except Exception as e:
+                await interaction.followup.send(f'❌ 播放失敗：{e}')
+                return
+
+            embed = self.song_embed('🎵 正在播放', song, discord.Color.blue())
+            await interaction.followup.send(embed=embed)
+
     @app_commands.command(name='pause', description='暫停播放')
     async def pause(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
@@ -436,12 +635,43 @@ class MusicCog(commands.Cog):
     async def skip(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
-            # 跳歌時清掉舊的預載，讓新的歌重新預載推薦
             self.get_state(interaction.guild_id).autoplay_prefetch = None
             vc.stop()
             await interaction.response.send_message('⏭️ 已跳過')
         else:
             await interaction.response.send_message('❌ 目前沒有在播放', ephemeral=True)
+
+    @app_commands.command(name='skipautoplay', description='跳過 Autoplay 預載的下一首，重新抓一首推薦')
+    async def skipautoplay(self, interaction: discord.Interaction):
+        state = self.get_state(interaction.guild_id)
+
+        if not state.autoplay:
+            await interaction.response.send_message('❌ Autoplay 目前是關閉的', ephemeral=True)
+            return
+        if not state.current:
+            await interaction.response.send_message('❌ 目前沒有在播放', ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        old = state.autoplay_prefetch
+        state.autoplay_prefetch = None
+        if old:
+            if old.get('title'):
+                state.history_titles.add(old['title'].lower().strip())
+            if old.get('webpage_url'):
+                state.history.append(old['webpage_url'])
+                if len(state.history) > 20:
+                    state.history.pop(0)
+
+        await self._prefetch_autoplay(interaction.guild_id)
+
+        if state.autoplay_prefetch:
+            t = state.autoplay_prefetch['title']
+            url = state.autoplay_prefetch.get('webpage_url', '')
+            await interaction.followup.send(f'🔀 已換掉，Autoplay 下一首改為：\n**[{t}]({url})**')
+        else:
+            await interaction.followup.send('⚠️ 找不到新的推薦，queue 空了之後會再試一次')
 
     @app_commands.command(name='stop', description='停止播放並清空隊列（留在頻道）')
     async def stop(self, interaction: discord.Interaction):
@@ -563,37 +793,6 @@ class MusicCog(commands.Cog):
         # 剛開啟時，如果歌正在播且 queue 空，立刻開始預載
         if state.autoplay and state.current and not state.queue and not state.autoplay_prefetch:
             asyncio.ensure_future(self._prefetch_autoplay(interaction.guild_id))
-
-    @app_commands.command(name='skipautoplay', description='跳過 Autoplay 預載的下一首，重新抓一首推薦')
-    async def skipautoplay(self, interaction: discord.Interaction):
-        state = self.get_state(interaction.guild_id)
-
-        if not state.autoplay:
-            await interaction.response.send_message('❌ Autoplay 目前是關閉的', ephemeral=True)
-            return
-        if not state.current:
-            await interaction.response.send_message('❌ 目前沒有在播放', ephemeral=True)
-            return
-
-        await interaction.response.defer()
-
-        # 清掉舊的預載，加目前那首到 history 讓下一首不重複
-        old = state.autoplay_prefetch
-        state.autoplay_prefetch = None
-        if old and old.get('webpage_url'):
-            state.history.append(old['webpage_url'])
-            if len(state.history) > 20:
-                state.history.pop(0)
-
-        # 重新預載
-        await self._prefetch_autoplay(interaction.guild_id)
-
-        if state.autoplay_prefetch:
-            t = state.autoplay_prefetch['title']
-            url = state.autoplay_prefetch.get('webpage_url', '')
-            await interaction.followup.send(f'🔀 已換掉，Autoplay 下一首改為：\n**[{t}]({url})**')
-        else:
-            await interaction.followup.send('⚠️ 找不到新的推薦，queue 空了之後會再試一次')
 
     @app_commands.command(name='disconnect', description='讓 Bot 離開語音頻道')
     async def disconnect(self, interaction: discord.Interaction):
