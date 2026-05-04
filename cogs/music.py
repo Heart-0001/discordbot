@@ -4,6 +4,7 @@ import logging
 import random
 import re
 import sys
+from datetime import datetime, timezone
 from typing import Optional
 
 import discord
@@ -16,7 +17,7 @@ log = logging.getLogger(__name__)
 FFMPEG_PATH = r'C:\Users\Heart\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin\ffmpeg.exe'
 
 FFMPEG_BEFORE_OPTS = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -thread_queue_size 4096 -probesize 32'
-FFMPEG_OPTS = '-vn -b:a 96k'  # 限制輸出 96kbps，符合 Discord 上限
+FFMPEG_OPTS = '-vn -b:a 128k'  # 限制輸出 128kbps，符合 Discord 上限
 
 # 搜尋評分：這些關鍵字出現在標題中代表不是原版官方音源，扣分
 _PENALIZED = re.compile(
@@ -793,6 +794,67 @@ class MusicCog(commands.Cog):
         # 剛開啟時，如果歌正在播且 queue 空，立刻開始預載
         if state.autoplay and state.current and not state.queue and not state.autoplay_prefetch:
             asyncio.ensure_future(self._prefetch_autoplay(interaction.guild_id))
+
+    @app_commands.command(name='info', description='顯示 Bot 目前的連線與播放狀態')
+    async def info(self, interaction: discord.Interaction):
+        state = self.get_state(interaction.guild_id)
+        vc = interaction.guild.voice_client
+        bot = interaction.client
+
+        embed = discord.Embed(title='📊 Bot 狀態資訊', color=discord.Color.blurple())
+
+        # ── Bot 本身 ──────────────────────────────────────
+        ping = round(bot.latency * 1000)
+        uptime_delta = datetime.now(timezone.utc) - bot.start_time
+        total_s = int(uptime_delta.total_seconds())
+        d, rem = divmod(total_s, 86400)
+        h, rem = divmod(rem, 3600)
+        m, s = divmod(rem, 60)
+        uptime_str = (f'{d}d ' if d else '') + f'{h:02d}:{m:02d}:{s:02d}'
+
+        embed.add_field(name='🏓 API 延遲', value=f'{ping} ms')
+        embed.add_field(name='⏳ 上線時間', value=uptime_str)
+        embed.add_field(name='🌐 連接伺服器', value=f'{len(bot.guilds)} 個')
+
+        # ── 語音連線 ─────────────────────────────────────
+        if vc and vc.is_connected():
+            voice_ping = round(vc.average_latency * 1000) if vc.average_latency else '—'
+            embed.add_field(name='🟢 語音頻道', value=vc.channel.name)
+            embed.add_field(name='📶 語音延遲', value=f'{voice_ping} ms')
+            # 伺服器支援的最高 bitrate
+            max_br = interaction.guild.bitrate_limit // 1000
+            embed.add_field(name='🎛️ 伺服器最高 Bitrate', value=f'{max_br} kbps')
+        else:
+            embed.add_field(name='🔴 語音頻道', value='未連線', inline=False)
+
+        # ── 音訊設定 ─────────────────────────────────────
+        embed.add_field(name='🎚️ 輸出 Bitrate', value='128 kbps')
+        embed.add_field(name='🔊 目前音量', value=f'{round(state.volume * 100)}%')
+
+        # ── 播放狀態 ─────────────────────────────────────
+        if vc and vc.is_playing():
+            play_status = f'🎵 播放中'
+        elif vc and vc.is_paused():
+            play_status = '⏸️ 暫停中'
+        else:
+            play_status = '⏹️ 閒置'
+        embed.add_field(name='狀態', value=play_status)
+
+        if state.current:
+            title = state.current['title']
+            title = title[:40] + '…' if len(title) > 40 else title
+            embed.add_field(name='🎶 目前歌曲', value=title, inline=False)
+
+        # ── Queue 資訊 ───────────────────────────────────
+        q_count = len(state.queue)
+        q_duration = sum(s.get('duration') or 0 for s in state.queue)
+        q_dur_str = self.fmt_duration(q_duration) if q_duration else '—'
+        embed.add_field(name='📋 Queue 歌曲數', value=f'{q_count} 首')
+        embed.add_field(name='⏱️ Queue 剩餘時長', value=q_dur_str)
+        embed.add_field(name='🔀 Autoplay', value='開啟 ✅' if state.autoplay else '關閉 ❌')
+
+        embed.set_footer(text=f'查詢時間：{datetime.now(timezone.utc).strftime("%H:%M:%S")} UTC')
+        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name='disconnect', description='讓 Bot 離開語音頻道')
     async def disconnect(self, interaction: discord.Interaction):
