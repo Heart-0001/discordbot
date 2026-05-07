@@ -19,3 +19,6 @@ venv/
 
 # Claude 設定
 .claude/
+.agents/
+skills-lock.json
+gh_login.ps1

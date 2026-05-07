@@ -53,6 +53,7 @@ async def sync_commands(ctx):
 async def main():
     async with bot:
         await bot.load_extension('cogs.music')
+        await bot.load_extension('cogs.bigtwo')
         await bot.start(os.getenv('DISCORD_TOKEN'))
 
 
