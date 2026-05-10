@@ -18,6 +18,16 @@ LOBBY_TIMEOUT = 300   # 5 minutes
 TURN_TIMEOUT = 60     # seconds before auto-pass
 
 
+def _member_name(guild: discord.Guild, uid: int) -> str:
+    member = guild.get_member(uid)
+    return member.display_name if member else str(uid)
+
+
+def _hand_file(cards, selected: set[int]) -> discord.File:
+    img = render_hand(cards, selected)
+    return discord.File(io.BytesIO(img), filename='hand.png')
+
+
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 def _load_stats() -> dict:
@@ -54,8 +64,7 @@ class LobbyView(discord.ui.View):
     def _embed(self, guild: discord.Guild) -> discord.Embed:
         lines = []
         for pid in self.game.players:
-            m = guild.get_member(pid)
-            name = m.display_name if m else str(pid)
+            name = _member_name(guild, pid)
             host = ' 👑' if pid == self.game.host_id else ''
             lines.append(f'• {name}{host}')
         embed = discord.Embed(title='🃏 大老二 — 等待玩家加入', color=0x27ae60)
@@ -127,14 +136,12 @@ class StatusView(discord.ui.View):
             return
         if uid != game.current_player:
             hand = game.hands[uid]
-            img = render_hand(hand, set())
-            file = discord.File(io.BytesIO(img), filename='hand.png')
+            file = _hand_file(hand, set())
             await interaction.response.send_message(
                 f'你有 **{len(hand)}** 張牌，還沒輪到你', file=file, ephemeral=True)
             return
         hand = game.hands[uid]
-        img = render_hand(hand, game.selected[uid])
-        file = discord.File(io.BytesIO(img), filename='hand.png')
+        file = _hand_file(hand, game.selected[uid])
         view = HandView(game, uid, self.cog)
         await interaction.response.send_message(
             embed=view.build_embed(), file=file, view=view, ephemeral=True)
@@ -191,8 +198,7 @@ class HandView(discord.ui.View):
             self.game.toggle(self.uid, idx)
             self._rebuild()
             hand = self.game.hands[self.uid]
-            img = render_hand(hand, self.game.selected[self.uid])
-            file = discord.File(io.BytesIO(img), filename='hand.png')
+            file = _hand_file(hand, self.game.selected[self.uid])
             await interaction.response.edit_message(
                 embed=self.build_embed(), attachments=[file], view=self)
         return cb
@@ -235,8 +241,7 @@ class HandView(discord.ui.View):
         self.game.clear_sel(self.uid)
         self._rebuild()
         hand = self.game.hands[self.uid]
-        img = render_hand(hand, set())
-        file = discord.File(io.BytesIO(img), filename='hand.png')
+        file = _hand_file(hand, set())
         await interaction.response.edit_message(
             embed=self.build_embed(), attachments=[file], view=self)
 
@@ -271,8 +276,7 @@ async def _send_stats(interaction: discord.Interaction):
         wins = data['wins']
         games = data['games']
         rate = f"{wins / games * 100:.0f}%" if games > 0 else "0%"
-        m = interaction.guild.get_member(int(uid_str))
-        name = m.display_name if m else uid_str
+        name = _member_name(interaction.guild, int(uid_str))
         medal = medals[rank] if rank < 3 else f'{rank + 1}.'
         lines.append(f'{medal} **{name}**：{wins} 勝 / {games} 場 ({rate})')
     embed = discord.Embed(title='🏆 大老二排行榜', color=0xe74c3c,
@@ -296,15 +300,13 @@ class BigTwo(commands.Cog):
         counts = game.card_counts()
         lines = []
         for pid in game.players:
-            m = guild.get_member(pid)
-            name = m.display_name if m else str(pid)
+            name = _member_name(guild, pid)
             n = counts.get(pid, 0)
             arrow = ' ◀ 輪到他出牌' if game.state == 'playing' and pid == game.current_player else ''
             lines.append(f'• **{name}**：{n} 張{arrow}')
         last = game.last_hand
         last_str = f'{last.type_name()} ➜ {last.display()}' if last else '（新的一輪，自由出牌）'
-        cur = guild.get_member(game.current_player) if game.state == 'playing' else None
-        cur_name = cur.display_name if cur else '？'
+        cur_name = _member_name(guild, game.current_player) if game.state == 'playing' else '？'
         embed = discord.Embed(title='🃏 大老二進行中', color=0x3498db)
         embed.add_field(name='玩家手牌數', value='\n'.join(lines), inline=False)
         embed.add_field(name='上一手', value=last_str, inline=False)
@@ -340,8 +342,7 @@ class BigTwo(commands.Cog):
         if game.state != 'playing':
             return
         uid = game.current_player
-        m = channel.guild.get_member(uid)
-        name = m.display_name if m else str(uid)
+        name = _member_name(channel.guild, uid)
         if game.first_turn:
             ok, result = game.auto_play_3c(uid)
             if ok:
@@ -369,15 +370,13 @@ class BigTwo(commands.Cog):
         winner_id = game.winner
         _record_result(winner_id, game.players)
 
-        winner = guild.get_member(winner_id)
-        wname = winner.display_name if winner else str(winner_id)
+        wname = _member_name(guild, winner_id)
 
         embed = discord.Embed(title='🎉 遊戲結束！', color=0xf39c12)
         embed.add_field(name='勝者', value=f'🥇 **{wname}**', inline=False)
         lines = []
         for pid in game.players:
-            m = guild.get_member(pid)
-            name = m.display_name if m else str(pid)
+            name = _member_name(guild, pid)
             remaining = len(game.hands.get(pid, []))
             lines.append(f'• {name}：剩 {remaining} 張')
         embed.add_field(name='各玩家結果', value='\n'.join(lines), inline=False)

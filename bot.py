@@ -24,6 +24,7 @@ intents.message_content = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
+EXTENSIONS = ('cogs.music', 'cogs.bigtwo')
 
 
 bot.start_time = datetime.now(timezone.utc)
@@ -52,8 +53,8 @@ async def sync_commands(ctx):
 
 async def main():
     async with bot:
-        await bot.load_extension('cogs.music')
-        await bot.load_extension('cogs.bigtwo')
+        for extension in EXTENSIONS:
+            await bot.load_extension(extension)
         await bot.start(os.getenv('DISCORD_TOKEN'))
 
 

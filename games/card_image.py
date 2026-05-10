@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from functools import lru_cache
 from PIL import Image, ImageDraw, ImageFont
 
 from .bigtwo_logic import Card, Suit, Value, VALUE_SYM, SUIT_SYM
@@ -20,6 +21,7 @@ BORDER_NORMAL = (190, 190, 190)
 BORDER_SEL = (60, 130, 220)
 
 
+@lru_cache(maxsize=1)
 def _fonts():
     candidates = ['arialbd.ttf', 'arial.ttf', 'DejaVuSans-Bold.ttf', 'DejaVuSans.ttf']
     for name in candidates:

@@ -4,6 +4,7 @@ import logging
 import random
 import re
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -39,15 +40,16 @@ def make_source(url: str, volume: float) -> discord.PCMVolumeTransformer:
     )
 
 
+@dataclass
 class GuildMusicState:
-    def __init__(self):
-        self.queue: list[dict] = []
-        self.current: Optional[dict] = None
-        self.volume: float = 0.5
-        self.autoplay: bool = False
-        self.history: list[str] = []        # 最近播過的 webpage_url（供 Radio Mix 用）
-        self.history_titles: set[str] = set()  # 正規化標題集合（防重複核心比對）
-        self.autoplay_prefetch: Optional[dict] = None  # 預載好的下一首（含串流 URL）
+    queue: list[dict] = field(default_factory=list)
+
+    current: Optional[dict] = None
+    volume: float = 0.5
+    autoplay: bool = False
+    history: list[str] = field(default_factory=list)
+    history_titles: set[str] = field(default_factory=set)
+    autoplay_prefetch: Optional[dict] = None
 
 
 class MusicCog(commands.Cog):
@@ -57,9 +59,80 @@ class MusicCog(commands.Cog):
         self._ytm = YTMusic()  # 不需要登入，搜尋 + radio 皆可用
 
     def get_state(self, guild_id: int) -> GuildMusicState:
-        if guild_id not in self._states:
-            self._states[guild_id] = GuildMusicState()
-        return self._states[guild_id]
+        return self._states.setdefault(guild_id, GuildMusicState())
+
+    @staticmethod
+    def _stream_args(query: str) -> list[str]:
+        return [
+            sys.executable, '-m', 'yt_dlp',
+            '--dump-json', '--quiet', '--no-warnings',
+            '--no-playlist',
+            '--format', 'bestaudio[abr<=96]/bestaudio/best',
+            '--ffmpeg-location', FFMPEG_PATH,
+            query,
+        ]
+
+    async def _connect_user_voice(self, interaction: discord.Interaction):
+        if not interaction.user.voice:
+            await interaction.response.send_message('❌ 請先加入一個語音頻道！', ephemeral=True)
+            return None
+
+        await interaction.response.defer()
+
+        vc = interaction.guild.voice_client
+        if vc is None:
+            return await interaction.user.voice.channel.connect()
+        if vc.channel != interaction.user.voice.channel:
+            await vc.move_to(interaction.user.voice.channel)
+        return vc
+
+    async def _fetch_songs_or_reply(self, interaction: discord.Interaction, query: str) -> list[dict] | None:
+        try:
+            songs = await self.fetch_info(query)
+        except Exception as e:
+            log.error(f'fetch_info 失敗: {e}')
+            await interaction.followup.send(f'❌ 無法取得音樂：{e}')
+            return None
+
+        if not songs:
+            await interaction.followup.send('❌ 找不到音樂')
+            return None
+        return songs
+
+    async def _ensure_stream_url(self, song: dict):
+        if not song.get('url'):
+            song['url'] = await self.fetch_stream_url(song['webpage_url'])
+
+    @staticmethod
+    def _remember_played(state: GuildMusicState, song: dict):
+        if song.get('webpage_url'):
+            state.history.append(song['webpage_url'])
+            if len(state.history) > 20:
+                state.history.pop(0)
+        if song.get('title'):
+            state.history_titles.add(song['title'].lower().strip())
+
+    def _schedule_prefetch(self, guild_id: int, state: GuildMusicState, *, queued: bool = False):
+        if state.autoplay and not state.queue and not state.autoplay_prefetch:
+            asyncio.ensure_future(self._prefetch_autoplay(guild_id))
+        elif queued and state.queue and not state.queue[0].get('url'):
+            asyncio.ensure_future(self._prefetch_next(state))
+
+    def _start_song(
+        self,
+        guild_id: int,
+        voice_client: discord.VoiceClient,
+        state: GuildMusicState,
+        song: dict,
+        *,
+        prefetch_queued: bool = False,
+    ):
+        state.current = song
+        source = make_source(song['url'], state.volume)
+        voice_client.play(source, after=lambda e: self._after_play(e, guild_id, voice_client))
+        log.info(f'開始播放: {song["title"]}')
+        self._remember_played(state, song)
+        self._schedule_prefetch(guild_id, state, queued=prefetch_queued)
 
     async def _run_ytdlp(self, args: list, timeout: int = 30) -> str:
         proc = await asyncio.create_subprocess_exec(
@@ -71,6 +144,7 @@ class MusicCog(commands.Cog):
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             proc.kill()
+            await proc.wait()
             raise Exception('取得音樂超時')
         if not stdout:
             err = stderr.decode('utf-8', errors='replace')
@@ -122,7 +196,7 @@ class MusicCog(commands.Cog):
     async def _ytmusic_search(self, query: str, count: int = 5) -> list[dict]:
         """用 ytmusicapi 在 YouTube Music 搜尋歌曲，回傳前 count 個候選。"""
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             raw = await loop.run_in_executor(
                 None,
                 lambda: self._ytm.search(query, filter='songs', limit=count),
@@ -205,14 +279,7 @@ class MusicCog(commands.Cog):
         else:
             if is_url:
                 # 直接抓指定 URL
-                out = await self._run_ytdlp([
-                    sys.executable, '-m', 'yt_dlp',
-                    '--dump-json', '--quiet', '--no-warnings',
-                    '--no-playlist',
-                    '--format', 'bestaudio[abr<=96]/bestaudio/best',
-                    '--ffmpeg-location', FFMPEG_PATH,
-                    query,
-                ], timeout=30)
+                out = await self._run_ytdlp(self._stream_args(query), timeout=30)
                 results = self._parse_ytdlp_lines(out, stream_url=True)
             else:
                 # 優先用 YouTube Music，取多個候選並評分選最官方版本
@@ -222,14 +289,7 @@ class MusicCog(commands.Cog):
                 else:
                     # YouTube Music 完全失敗才退回 YouTube 搜尋
                     log.info('YouTube Music 失敗，退回 ytsearch1:')
-                    out = await self._run_ytdlp([
-                        sys.executable, '-m', 'yt_dlp',
-                        '--dump-json', '--quiet', '--no-warnings',
-                        '--no-playlist',
-                        '--format', 'bestaudio[abr<=96]/bestaudio/best',
-                        '--ffmpeg-location', FFMPEG_PATH,
-                        f'ytsearch1:{query}',
-                    ], timeout=30)
+                    out = await self._run_ytdlp(self._stream_args(f'ytsearch1:{query}'), timeout=30)
                     results = self._parse_ytdlp_lines(out, stream_url=True)
 
         log.info(f'fetch_info 完成: {len(results)} 首')
@@ -237,14 +297,7 @@ class MusicCog(commands.Cog):
 
     async def fetch_stream_url(self, webpage_url: str) -> str:
         """播放前取得實際串流 URL。"""
-        out = await self._run_ytdlp([
-            sys.executable, '-m', 'yt_dlp',
-            '--dump-json', '--quiet', '--no-warnings',
-            '--no-playlist',
-            '--format', 'bestaudio[abr<=96]/bestaudio/best',
-            '--ffmpeg-location', FFMPEG_PATH,
-            webpage_url,
-        ], timeout=30)
+        out = await self._run_ytdlp(self._stream_args(webpage_url), timeout=30)
         data = json.loads(out.strip().split('\n')[0])
         return data['url']
 
@@ -268,7 +321,7 @@ class MusicCog(commands.Cog):
             return []
         video_id = match.group(1)
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             data = await loop.run_in_executor(
                 None,
                 lambda: self._ytm.get_watch_playlist(videoId=video_id, radio=True, limit=10),
@@ -342,30 +395,14 @@ class MusicCog(commands.Cog):
         # 取得串流 URL（預載的歌已有，flat 結果沒有）
         if not next_song.get('url'):
             try:
-                next_song['url'] = await self.fetch_stream_url(next_song['webpage_url'])
+                await self._ensure_stream_url(next_song)
             except Exception as e:
                 log.error(f'重新取得 URL 失敗，跳過: {e}')
                 await self._play_next(guild_id, voice_client)
                 return
 
-        state.current = next_song
-
         try:
-            source = make_source(next_song['url'], state.volume)
-            voice_client.play(source, after=lambda e: self._after_play(e, guild_id, voice_client))
-            log.info(f'開始播放: {next_song["title"]}')
-            # 記錄播放歷史（最多保留 20 首）
-            if next_song.get('webpage_url'):
-                state.history.append(next_song['webpage_url'])
-                if len(state.history) > 20:
-                    state.history.pop(0)
-            if next_song.get('title'):
-                state.history_titles.add(next_song['title'].lower().strip())
-            # 歌開始播就立刻在背景預載下一首
-            if state.autoplay and not state.queue and not state.autoplay_prefetch:
-                asyncio.ensure_future(self._prefetch_autoplay(guild_id))
-            elif state.queue and not state.queue[0].get('url'):
-                asyncio.ensure_future(self._prefetch_next(state))
+            self._start_song(guild_id, voice_client, state, next_song, prefetch_queued=True)
         except Exception as e:
             log.error(f'播放失敗: {e}')
 
@@ -404,29 +441,12 @@ class MusicCog(commands.Cog):
     @app_commands.command(name='play', description='播放 YouTube / YouTube Music 音樂（網址或搜尋）')
     @app_commands.describe(query='YouTube 連結或歌曲名稱關鍵字')
     async def play(self, interaction: discord.Interaction, query: str):
-        if not interaction.user.voice:
-            await interaction.response.send_message('❌ 請先加入一個語音頻道！', ephemeral=True)
-            return
-
-        await interaction.response.defer()
-
-        vc = interaction.guild.voice_client
+        vc = await self._connect_user_voice(interaction)
         if vc is None:
-            vc = await interaction.user.voice.channel.connect()
-        elif vc.channel != interaction.user.voice.channel:
-            await vc.move_to(interaction.user.voice.channel)
-
-        state = self.get_state(interaction.guild_id)
-
-        try:
-            songs = await self.fetch_info(query)
-        except Exception as e:
-            log.error(f'fetch_info 失敗: {e}')
-            await interaction.followup.send(f'❌ 無法取得音樂：{e}')
             return
-
-        if not songs:
-            await interaction.followup.send('❌ 找不到音樂')
+        state = self.get_state(interaction.guild_id)
+        songs = await self._fetch_songs_or_reply(interaction, query)
+        if songs is None:
             return
 
         log.info(f'取得音樂: {songs[0]["title"]} (共 {len(songs)} 首)')
@@ -450,27 +470,13 @@ class MusicCog(commands.Cog):
             # Fetch stream URL if not available (playlist flat items)
             if not first.get('url'):
                 try:
-                    first['url'] = await self.fetch_stream_url(first['webpage_url'])
+                    await self._ensure_stream_url(first)
                 except Exception as e:
                     await interaction.followup.send(f'❌ 無法取得串流：{e}')
                     return
 
-            state.current = first
-
             try:
-                source = make_source(first['url'], state.volume)
-                vc.play(source, after=lambda e: self._after_play(e, interaction.guild_id, vc))
-                log.info(f'開始播放: {first["title"]}')
-                # 第一首也要加進 history，避免 autoplay 重複推薦
-                if first.get('webpage_url'):
-                    state.history.append(first['webpage_url'])
-                    if len(state.history) > 20:
-                        state.history.pop(0)
-                if first.get('title'):
-                    state.history_titles.add(first['title'].lower().strip())
-                # 歌開始播就立刻預載 autoplay 下一首
-                if state.autoplay and not state.queue and not state.autoplay_prefetch:
-                    asyncio.ensure_future(self._prefetch_autoplay(interaction.guild_id))
+                self._start_song(interaction.guild_id, vc, state, first)
             except Exception as e:
                 log.error(f'播放失敗: {e}')
                 await interaction.followup.send(f'❌ 播放失敗：{e}')
@@ -484,28 +490,12 @@ class MusicCog(commands.Cog):
     @app_commands.command(name='randomlist', description='播放清單但隨機打亂順序')
     @app_commands.describe(query='YouTube 播放清單連結或歌曲名稱')
     async def randomlist(self, interaction: discord.Interaction, query: str):
-        if not interaction.user.voice:
-            await interaction.response.send_message('❌ 請先加入一個語音頻道！', ephemeral=True)
-            return
-
-        await interaction.response.defer()
-
-        vc = interaction.guild.voice_client
+        vc = await self._connect_user_voice(interaction)
         if vc is None:
-            vc = await interaction.user.voice.channel.connect()
-        elif vc.channel != interaction.user.voice.channel:
-            await vc.move_to(interaction.user.voice.channel)
-
-        state = self.get_state(interaction.guild_id)
-
-        try:
-            songs = await self.fetch_info(query)
-        except Exception as e:
-            await interaction.followup.send(f'❌ 無法取得音樂：{e}')
             return
-
-        if not songs:
-            await interaction.followup.send('❌ 找不到音樂')
+        state = self.get_state(interaction.guild_id)
+        songs = await self._fetch_songs_or_reply(interaction, query)
+        if songs is None:
             return
 
         random.shuffle(songs)
@@ -525,24 +515,13 @@ class MusicCog(commands.Cog):
 
             if not first.get('url'):
                 try:
-                    first['url'] = await self.fetch_stream_url(first['webpage_url'])
+                    await self._ensure_stream_url(first)
                 except Exception as e:
                     await interaction.followup.send(f'❌ 無法取得串流：{e}')
                     return
 
-            state.current = first
             try:
-                source = make_source(first['url'], state.volume)
-                vc.play(source, after=lambda e: self._after_play(e, interaction.guild_id, vc))
-                log.info(f'開始播放: {first["title"]}')
-                if first.get('webpage_url'):
-                    state.history.append(first['webpage_url'])
-                    if len(state.history) > 20:
-                        state.history.pop(0)
-                if first.get('title'):
-                    state.history_titles.add(first['title'].lower().strip())
-                if state.autoplay and not state.queue and not state.autoplay_prefetch:
-                    asyncio.ensure_future(self._prefetch_autoplay(interaction.guild_id))
+                self._start_song(interaction.guild_id, vc, state, first)
             except Exception as e:
                 await interaction.followup.send(f'❌ 播放失敗：{e}')
                 return
@@ -554,28 +533,12 @@ class MusicCog(commands.Cog):
     @app_commands.command(name='nextplay', description='插入歌曲到下一首播放')
     @app_commands.describe(query='YouTube 連結或歌曲名稱關鍵字')
     async def nextplay(self, interaction: discord.Interaction, query: str):
-        if not interaction.user.voice:
-            await interaction.response.send_message('❌ 請先加入一個語音頻道！', ephemeral=True)
-            return
-
-        await interaction.response.defer()
-
-        vc = interaction.guild.voice_client
+        vc = await self._connect_user_voice(interaction)
         if vc is None:
-            vc = await interaction.user.voice.channel.connect()
-        elif vc.channel != interaction.user.voice.channel:
-            await vc.move_to(interaction.user.voice.channel)
-
-        state = self.get_state(interaction.guild_id)
-
-        try:
-            songs = await self.fetch_info(query)
-        except Exception as e:
-            await interaction.followup.send(f'❌ 無法取得音樂：{e}')
             return
-
-        if not songs:
-            await interaction.followup.send('❌ 找不到音樂')
+        state = self.get_state(interaction.guild_id)
+        songs = await self._fetch_songs_or_reply(interaction, query)
+        if songs is None:
             return
 
         # 只取第一首插入到 queue 最前面
@@ -589,24 +552,13 @@ class MusicCog(commands.Cog):
             # 沒在播就直接播
             if not song.get('url'):
                 try:
-                    song['url'] = await self.fetch_stream_url(song['webpage_url'])
+                    await self._ensure_stream_url(song)
                 except Exception as e:
                     await interaction.followup.send(f'❌ 無法取得串流：{e}')
                     return
 
-            state.current = song
             try:
-                source = make_source(song['url'], state.volume)
-                vc.play(source, after=lambda e: self._after_play(e, interaction.guild_id, vc))
-                log.info(f'開始播放: {song["title"]}')
-                if song.get('webpage_url'):
-                    state.history.append(song['webpage_url'])
-                    if len(state.history) > 20:
-                        state.history.pop(0)
-                if song.get('title'):
-                    state.history_titles.add(song['title'].lower().strip())
-                if state.autoplay and not state.queue and not state.autoplay_prefetch:
-                    asyncio.ensure_future(self._prefetch_autoplay(interaction.guild_id))
+                self._start_song(interaction.guild_id, vc, state, song)
             except Exception as e:
                 await interaction.followup.send(f'❌ 播放失敗：{e}')
                 return
